@@ -1,0 +1,9 @@
+[submodule "extern/glfw"]
+	path = extern/glfw
+	url = https://www.github.com/ludviggunne/glfw.git
+[submodule "extern/glad-cmake-3.3"]
+	path = extern/glad-cmake-3.3
+	url = https://www.github.com/ludviggunne/glad-cmake-3.3.git
+[submodule "extern/cglm"]
+	path = extern/cglm
+	url = https://www.github.com/ludviggunne/cglm.git
