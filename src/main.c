@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <assert.h>
+#include <math.h>
 
 #include "glad/glad.h"
 #include "glfw/glfw3.h"
@@ -38,7 +39,8 @@
 /* Style */
 #define WINDOW_INIT_W   800
 #define WINDOW_INIT_H   600
-#define CTRLP_SIZE      5
+#define CTRLP_SIZE      3
+#define CIRCLE_SEGMENTS 64
 
 #define BGD_C         0xFFFFFFFF
 vec4s   bgd_c;
@@ -74,12 +76,21 @@ typedef struct {
 
 typedef struct {
     vec2s position;
+    vec2s radius_pos;
+} Circle;
+
+typedef struct {
+    vec2s position;
 } Viewer;
 
-SH_VECTOR_DECL(Segment, MAX_OBJECTS,    segment);
-SH_VECTOR_DECL(Rect,    MAX_OBJECTS,    rect);
-SH_VECTOR_DECL(Viewer,  MAX_VIEWERS,    viewer);
-SH_VECTOR_DECL(vec2s,   MAX_SEG_POINTS, vec2);
+SH_VECTOR_DECL(Segment,    MAX_OBJECTS,    segment);
+SH_VECTOR_DECL(Rect,       MAX_OBJECTS,    rect);
+SH_VECTOR_DECL(Circle,     MAX_OBJECTS,    circle);
+SH_VECTOR_DECL(Viewer,     MAX_VIEWERS,    viewer);
+SH_VECTOR_DECL(vec2s,      MAX_SEG_POINTS, vec2);
+SH_VECTOR_DECL(float,      MAX_OBJECTS,    float);
+SH_VECTOR_DECL(Vertex,     BATCH_SIZE,     vertex);
+SH_VECTOR_DECL(uint32_t,   BATCH_SIZE,     index)
 
 typedef struct {
 
@@ -87,6 +98,7 @@ typedef struct {
         SE_NONE = 0, 
         SE_SEG, 
         SE_RECT,
+        SE_CIRCLE, 
         SE_VIEWER
     } type;
 
@@ -98,6 +110,7 @@ typedef struct {
         CP_RB,
         CP_P1,
         CP_P2,
+        CP_RADIUS,
         CP_CENTER
     } control_point;
 
@@ -109,11 +122,8 @@ typedef struct {
 /* - STATE */
 struct _UIstate {
 
-    Vertex   vertex_data[BATCH_SIZE];
-    size_t   vertex_count;
-
-    uint32_t index_data[BATCH_SIZE];
-    size_t   index_count;
+    sh_vector_vertex vertices;
+    sh_vector_index  indices;
 
     GLint program;
     VertexArray vao;
@@ -131,15 +141,15 @@ struct _WindowState {
     GLFWwindow *handle;
 } WindowState;
 
-#define MAX_OBJECTS 128
 struct _ControlState {
 
     vec2s click_pos;
     union {
-        vec2s view_center;
-        Rect  rect;
+        vec2s   view_center;
+        Rect    rect;
+        Circle  circle;
         Segment segment;
-        Viewer viewer;
+        Viewer  viewer;
     } reference;
     vec2s selection_offset;
     vec2s build_origin;
@@ -148,6 +158,7 @@ struct _ControlState {
     
     sh_vector_segment segments;
     sh_vector_rect    rects;
+    sh_vector_circle  circles;
     sh_vector_viewer  viewers;
 
     ControllableSelection selection;
@@ -157,6 +168,7 @@ struct _ControlState {
         ST_PAN,
         ST_BUILD_SEGMENT,
         ST_BUILD_RECT,
+        ST_BUILD_CIRCLE,
         ST_MOVE
     } state;
 
@@ -167,13 +179,18 @@ struct _Simulation {
     VertexArray vao;
     GLint       program;
 
-    sh_vector_vec2 seg_points;
+    sh_vector_vec2  seg_points;
+    sh_vector_vec2  circle_centers;
+    sh_vector_float circle_radii;
 
     struct _SimulationUniformLocations {
 
         GLint 
             seg_points,
             seg_point_count,
+            circle_centers,
+            circle_radii,
+            circle_count,
             viewer_origin,
             view_center,
             view,
@@ -216,8 +233,11 @@ const char *generic_fragment_source = SHADER_SOURCE(#version 330 core\n
 
 const char *simulation_fragment_source = SHADER_SOURCE(#version 330 core\n
 
-    uniform vec2  u_seg_points[1024];
+    uniform vec2  u_seg_points[256];
     uniform int   u_seg_point_count;
+    uniform vec2  u_circle_centers[256];
+    uniform float u_circle_radii[256];
+    uniform int   u_circle_count;
     uniform vec2  u_viewer_origin;
     uniform vec2  u_view_center;
     uniform vec2  u_buffer_size;
@@ -229,7 +249,7 @@ const char *simulation_fragment_source = SHADER_SOURCE(#version 330 core\n
         return a.x * b.y - a.y * b.x;
     }
 
-    bool intersect(vec2 p, vec2 p2, vec2 q, vec2 q2)
+    bool line_intersect(vec2 p, vec2 p2, vec2 q, vec2 q2)
     {
         vec2 r = p2 - p;
         vec2 s = q2 - q;
@@ -246,23 +266,54 @@ const char *simulation_fragment_source = SHADER_SOURCE(#version 330 core\n
         return true;
     }
 
+    bool circle_intersect(vec2 p, vec2 q, vec2 center, float radius)
+    {
+        vec2 a = q - p;
+        vec2 b = center - p;
+        float f = dot(a, b) / length(a) / length(a);
+        vec2 proj = f * a;
+        float proj_d1 = distance(proj, b);
+        float proj_d2 = length(proj) * sign(f);
+
+        if (proj_d1 > radius) return false;
+
+        float x = sqrt(radius * radius - proj_d1 * proj_d1);
+        float x0 = proj_d2 - x;
+        float x1 = proj_d2 + x;
+
+        float l = length(a);
+
+        if ((x0 < 0.0 || x0 > l) && (x1 < 0.0 || x1 > l)) return false;
+
+        return true;
+    }
+
     void main() {
 
         vec2 sample = vec2(gl_FragCoord.x - 0.5 * u_buffer_size.x, 0.5 * u_buffer_size.y - gl_FragCoord.y) + u_view_center;
 
-
         for (int i = 0; i < u_seg_point_count; i += 2) {
 
-            if (intersect(
+            if (line_intersect(
                 u_seg_points[i],
                 u_seg_points[i + 1],
                 u_viewer_origin,
                 sample
             )) {
-                
                 discard;
             }
+        }
 
+        for (int i = 0; i < u_circle_count; i++) {
+
+            if (circle_intersect(
+                u_viewer_origin,
+                sample,
+                u_circle_centers[i],
+                u_circle_radii[i]
+            )) {
+                discard;
+            }
         }
 
         gl_FragColor = vec4(0.2, 0.2, 0.2, 0.2);
@@ -290,6 +341,7 @@ void initUIstate();
 
 void pushUIline(float x1, float y1, float x2, float y2, vec4s color);
 void pushUIquad(float x, float y, float w, float h, vec4s color);
+void pushUIcircle(float x, float y, float radius, vec4s color);
 void beginUI(GLenum mode);
 void flushUI();
 
@@ -299,14 +351,17 @@ vec4s color(int hex);
 void drawControlPoint(float x, float y, int selected);
 void drawRectLines(Rect *rect, int selected);
 void drawSegmentLines(Segment *seg, int selected);
+void drawCircleLines(Circle *circle, int selected);
 void drawRectControlPoints(Rect *rect, int selected);
 void drawSegmentControlPoints(Segment *seg, int selected);
+void drawCircleControlPoints(Circle *circle, int selected);
 void drawControlState();
 
 /* Simulation */
 void initSimulation();
 void renderViewers();
 void pushSegments();
+void pushCircles();
 
 /* Callbacks */
 void callbackResize(GLFWwindow *window, int width, int height);
@@ -318,22 +373,27 @@ void initControlState();
 void updateControlState();
 
 int lineIsHovered(vec2s mouse, vec2s p1, vec2s p2);
+int circleIsHovered(vec2s mouse, vec2s center, float radius);
 int controlPointIsHovered(vec2s mouse, vec2s pos);
 
 int testSegmentSelection(vec2s mouse, size_t index);
 int testRectSelection(vec2s mouse, size_t index);
+int testCircleSelection(vec2s mouse, size_t index);
 int testViewerSelection(vec2s mouse, size_t index);
 void testSelections();
 
 vec2s mousePosW();
 vec2s mousePos();
+float getRadius(Circle *circle);
 
 void moveSegment(vec2s move_offset);
 void moveRect(vec2s move_offset);
+void moveCircle(vec2s move_offset);
 void moveViewer(vec2s move_offset);
 
 void buildSegment();
 void buildRect();
+void buildCircle();
 
 void deleteSelected();
 
@@ -379,6 +439,7 @@ int main(int argc, char *argv[])
         glClearColor(bgd_c.r, bgd_c.g, bgd_c.b, 1.0f);
 
         pushSegments();
+        pushCircles();
         renderViewers();
 
         beginUI(GL_TRIANGLES);
@@ -534,11 +595,11 @@ void vaoDraw(VertexArray *vao, GLenum mode)
 void initUIstate()
 {
     UIstate = (struct _UIstate) {
-        .vertex_count = 0,
-        .index_count  = 0,
-        .program = compileProgram(generic_vertex_source, generic_fragment_source),
-        .vao = vaoCreate(),
-        .mode = GL_LINES
+        .vertices = SH_VECTOR_INIT(vertex),
+        .indices  = SH_VECTOR_INIT(index),
+        .program  = compileProgram(generic_vertex_source, generic_fragment_source),
+        .vao      = vaoCreate(),
+        .mode     = GL_LINES
     };
 
     UIstate.view_uniform_location = getUniformLocation(UIstate.program, "u_view");
@@ -556,84 +617,94 @@ void initUIstate()
 void pushUIline(float x1, float y1, float x2, float y2, vec4s color)
 {
     if (
-        UIstate.mode         != GL_LINES       || 
-        UIstate.index_count  >= BATCH_SIZE - 2 || 
-        UIstate.vertex_count >= BATCH_SIZE - 2
+        UIstate.mode          != GL_LINES       || 
+        UIstate.indices.size  >= BATCH_SIZE - 2 || 
+        UIstate.vertices.size >= BATCH_SIZE - 2
     ) {
 
         flushUI();
         beginUI(GL_LINES);
     }
 
-    size_t voffset = UIstate.vertex_count;
+    size_t voffset = UIstate.vertices.size;
 
-    UIstate.vertex_data[UIstate.vertex_count] = (Vertex) {
+    sh_vector_vertex_push(&UIstate.vertices, (Vertex) {
         .position = (vec2s) { x1, y1 },
         .color = color
-    };
-    ++UIstate.vertex_count;
+    });
 
-    UIstate.vertex_data[UIstate.vertex_count] = (Vertex) {
+    sh_vector_vertex_push(&UIstate.vertices, (Vertex) {
         .position = (vec2s) { x2, y2 },
         .color = color
-    };
-    ++UIstate.vertex_count;
+    });
 
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset;
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset + 1;
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset);
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset + 1);
 }
 
 void pushUIquad(float x, float y, float w, float h, vec4s color)
 {
     if (
-        UIstate.mode         != GL_TRIANGLES   || 
-        UIstate.index_count  >= BATCH_SIZE - 6 || 
-        UIstate.vertex_count >= BATCH_SIZE - 4
+        UIstate.mode          != GL_TRIANGLES   || 
+        UIstate.indices.size  >= BATCH_SIZE - 6 || 
+        UIstate.vertices.size >= BATCH_SIZE - 4
     ) {
 
         flushUI();
         beginUI(GL_TRIANGLES);
     }
 
-    size_t voffset = UIstate.vertex_count;
+    size_t voffset = UIstate.vertices.size;
 
-    UIstate.vertex_data[UIstate.vertex_count] = (Vertex) {
+    sh_vector_vertex_push(&UIstate.vertices, (Vertex) {
         .position = (vec2s) { x, y },
         .color = color
-    };
-    ++UIstate.vertex_count;
+    });
 
-    UIstate.vertex_data[UIstate.vertex_count] = (Vertex) {
+    sh_vector_vertex_push(&UIstate.vertices, (Vertex) {
         .position = (vec2s) { x + w, y },
         .color = color
-    };
-    ++UIstate.vertex_count;
+    });
 
-    UIstate.vertex_data[UIstate.vertex_count] = (Vertex) {
+    sh_vector_vertex_push(&UIstate.vertices, (Vertex) {
         .position = (vec2s) { x, y + h },
         .color = color
-    };
-    ++UIstate.vertex_count;
+    });
 
-    UIstate.vertex_data[UIstate.vertex_count] = (Vertex) {
+    sh_vector_vertex_push(&UIstate.vertices, (Vertex) {
         .position = (vec2s) { x + w, y + h },
         .color = color
-    };
-    ++UIstate.vertex_count;
+    });
 
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset;
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset + 1;
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset + 2;
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset + 1;
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset + 2;
-    UIstate.index_data[UIstate.index_count++] = (uint32_t)voffset + 3;
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset);
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset + 1);
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset + 2);
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset + 1);
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset + 2);
+    sh_vector_index_push(&UIstate.indices, (uint32_t)voffset + 3);
+}
+
+void pushUIcircle(float x, float y, float radius, vec4s color)
+{
+    for (int i = 0; i < CIRCLE_SEGMENTS; i++) {
+
+        float a0 = i * 2.0f * (float)M_PI / CIRCLE_SEGMENTS;
+        float x0 = x + radius * cosf(a0);
+        float y0 = y + radius * sinf(a0);
+
+        float a1 = (i + 1) * 2.0f * (float)M_PI / CIRCLE_SEGMENTS;
+        float x1 = x + radius * cosf(a1);
+        float y1 = y + radius * sinf(a1);
+
+        pushUIline(x0, y0, x1, y1, color);
+    }
 }
 
 void beginUI(GLenum mode)
 {
-    UIstate.vertex_count = 0;
-    UIstate.index_count  = 0;
-    UIstate.mode         = mode;
+    sh_vector_vertex_clear(&UIstate.vertices);
+    sh_vector_index_clear(&UIstate.indices);
+    UIstate.mode = mode;
 }
 
 void flushUI()
@@ -641,8 +712,8 @@ void flushUI()
     GL_CALL(glUseProgram(UIstate.program));
     updateUIView();
     GL_CALL( glUniformMatrix4fv(UIstate.view_uniform_location, 1, GL_FALSE, (const GLfloat*)UIstate.view_uniform.raw) );
-    vaoVertexData(&UIstate.vao, UIstate.vertex_data, UIstate.vertex_count);
-    vaoIndexData(&UIstate.vao,  UIstate.index_data,  UIstate.index_count);
+    vaoVertexData(&UIstate.vao, UIstate.vertices.data, UIstate.vertices.size);
+    vaoIndexData(&UIstate.vao,  UIstate.indices.data,  UIstate.indices.size);
     vaoDraw(&UIstate.vao, UIstate.mode);
 }
 
@@ -664,6 +735,7 @@ void initControlState()
     ControlState = (struct _ControlState) {
         .segments  =  SH_VECTOR_INIT(segment),
         .rects     =  SH_VECTOR_INIT(rect),
+        .circles   =  SH_VECTOR_INIT(circle),
         .viewers   =  SH_VECTOR_INIT(viewer),
         .selection = { .type = SE_NONE, .index = 0},
         .state     = ST_IDLE,
@@ -726,6 +798,19 @@ void callbackMouse(GLFWwindow *window, int button, int action, int mods)
                         };
 
                         ControlState.state = ST_IDLE;
+
+                    } else if (glfwGetKey(WindowState.handle, GLFW_KEY_LEFT_ALT) == GLFW_PRESS) {
+                        
+                        Circle circle = (Circle) { .position = ControlState.build_origin, .radius_pos = ControlState.build_origin };
+                        if (!sh_vector_circle_push(&ControlState.circles, circle)) break;
+
+                        ControlState.selection = (ControllableSelection) {
+                            .type = SE_CIRCLE,
+                            .index = ControlState.circles.size - 1,
+                            .control_point = CP_NONE
+                        };
+
+                        ControlState.state = ST_BUILD_CIRCLE;
 
                     } else {
                         
@@ -829,6 +914,13 @@ void drawSegmentLines(Segment *seg, int selected)
     pushUIline(seg->p1.x, seg->p1.y, seg->p2.x, seg->p2.y, color);
 }
 
+void drawCircleLines(Circle *circle, int selected)
+{
+
+    vec4s color = selected ? selection_c : segment_c;
+    pushUIcircle(circle->position.x, circle->position.y, getRadius(circle), color);
+}
+
 void drawControlPoint(float x, float y, int selected)
 {
     vec4s color = selected ? selection_c : ctrlp_c;
@@ -853,6 +945,13 @@ void drawSegmentControlPoints(Segment *seg, int selected)
     drawControlPoint((seg->p1.x + seg->p2.x) / 2, (seg->p1.y + seg->p2.y) / 2, selected);
 }
 
+void drawCircleControlPoints(Circle *circle, int selected)
+{
+
+    drawControlPoint(circle->position.x, circle->position.y, selected);
+    drawControlPoint(circle->radius_pos.x, circle->radius_pos.y, selected);
+}
+
 void drawControlState()
 {
 
@@ -866,6 +965,19 @@ void drawControlState()
 
         drawRectLines(&ControlState.rects.data[i], 
             i == ControlState.selection.index && ControlState.selection.type == SE_RECT);
+    }
+
+    for (int i = 0; i < ControlState.circles.size; i++) {
+
+        drawCircleLines(&ControlState.circles.data[i],
+            i == ControlState.selection.index && ControlState.selection.type == SE_CIRCLE);
+    }
+
+
+    for (int i = 0; i < ControlState.viewers.size; i++) {
+
+        drawControlPoint(ControlState.viewers.data[i].position.x, ControlState.viewers.data[i].position.y, 
+            i == ControlState.selection.index && ControlState.selection.type == SE_VIEWER);
     }
 
     if (!ControlState.show_control_points) return;
@@ -883,11 +995,12 @@ void drawControlState()
             i == ControlState.selection.index && ControlState.selection.type == SE_RECT);
     }
 
-    for (int i = 0; i < ControlState.viewers.size; i++) {
+    for (int i = 0; i < ControlState.circles.size; i++) {
 
-        drawControlPoint(ControlState.viewers.data[i].position.x, ControlState.viewers.data[i].position.y, 
-            i == ControlState.selection.index && ControlState.selection.type == SE_VIEWER);
+        drawCircleControlPoints(&ControlState.circles.data[i],
+            i == ControlState.selection.index && ControlState.selection.type == SE_CIRCLE);
     }
+
 }
 
 int lineIsHovered(vec2s mouse, vec2s p1, vec2s p2)
@@ -909,6 +1022,17 @@ int lineIsHovered(vec2s mouse, vec2s p1, vec2s p2)
     }
 
     return 1;
+}
+
+int circleIsHovered(vec2s mouse, vec2s center, float radius)
+{
+    float d = glms_vec2_norm(glms_vec2_sub(mouse, center)) - radius;
+    if (fabsf(d) < SELECTION_DISTANCE) {
+
+        return 1;
+    }
+
+    return 0;
 }
 
 int controlPointIsHovered(vec2s mouse, vec2s pos)
@@ -1084,9 +1208,53 @@ int testRectSelection(vec2s mouse, size_t index)
     return 0;
 }
 
+int testCircleSelection(vec2s mouse, size_t index)
+{
+    Circle *circle = &ControlState.circles.data[index];
+
     if (!ControlState.show_control_points) goto just_check_line;
 
+    if (controlPointIsHovered(mouse, circle->position)) {
+
+        ControlState.selection = (ControllableSelection) {
+            .control_point = CP_CENTER,
+            .index         = index,
+            .type          = SE_CIRCLE,
+        };
+        ControlState.state = ST_MOVE;
+        ControlState.selection_offset = glms_vec2_sub(circle->position, mouse);
+        ControlState.reference.circle = *circle;
+        return 1;
+    }
+
+    if (controlPointIsHovered(mouse, circle->radius_pos)) {
+
+        ControlState.selection = (ControllableSelection) {
+            .control_point = CP_RADIUS,
+            .index         = index,
+            .type          = SE_CIRCLE,
+        };
+        ControlState.state = ST_MOVE;
+        ControlState.selection_offset = glms_vec2_sub(circle->radius_pos, mouse);
+        ControlState.reference.circle = *circle;
+        return 1;
+    }
+
     just_check_line:
+
+    if (circleIsHovered(mouse, circle->position, getRadius(circle))) {
+
+        ControlState.selection = (ControllableSelection) {
+            .control_point = CP_NONE,
+            .index         = index,
+            .type          = SE_CIRCLE
+        };
+        ControlState.state   = ST_IDLE;
+        return 1;
+    }
+
+    return 0;
+}
 
 int testViewerSelection(vec2s mouse, size_t index)
 {
@@ -1134,6 +1302,13 @@ void testSelections()
         }
     }
 
+    for (int i = 0; i < ControlState.circles.size; i++) {
+
+        if (testCircleSelection(mouse, i)) {
+            return;
+        }
+    }
+
     ControlState.selection = (ControllableSelection) {0};
 }
 
@@ -1152,6 +1327,12 @@ vec2s mousePos()
     m.y -= WindowState.height / 2;
     m = glms_vec2_add(m, UIstate.view_center);
     return m;
+}
+
+float getRadius(Circle *circle)
+{
+
+    return glms_vec2_norm(glms_vec2_sub(circle->position, circle->radius_pos));
 }
 
 void updateControlState()
@@ -1183,10 +1364,17 @@ void updateControlState()
                     moveRect(move_offset);
                     break;
 
+                case SE_CIRCLE:
+
+                    moveCircle(move_offset);
+                    break;
+
                 case SE_VIEWER:
 
                     moveViewer(move_offset);
                     break;
+
+                default: break;
             }
             break;
         
@@ -1199,6 +1387,13 @@ void updateControlState()
 
             buildSegment();
             break;
+
+        case ST_BUILD_CIRCLE:
+
+            buildCircle();
+            break;
+
+        default: break;
     }
 }
 
@@ -1259,11 +1454,35 @@ void moveRect(vec2s move_offset)
         case CP_CENTER:
             rect->position = glms_vec2_add(glms_vec2_add(ref->position, move_offset), ControlState.selection_offset);
             break;
+
+        default: break;
+    }
+}
+
+void moveCircle(vec2s move_offset)
+{
+
+    Circle *circle = &ControlState.circles.data[ControlState.selection.index];
+    Circle *ref = &ControlState.reference.circle;
+
+    switch (ControlState.selection.control_point) {
+
+        case CP_CENTER:
+            circle->position   = glms_vec2_add(glms_vec2_add(ref->position, move_offset), ControlState.selection_offset);
+            circle->radius_pos = glms_vec2_add(glms_vec2_add(ref->radius_pos, move_offset), ControlState.selection_offset);
+            break;
+
+        case CP_RADIUS:
+            circle->radius_pos = glms_vec2_add(glms_vec2_add(ref->radius_pos, move_offset), ControlState.selection_offset);
+            break;
+
+        default: break;
     }
 }
 
 void moveViewer(vec2s move_offset)
 {
+
     Viewer *viewer = &ControlState.viewers.data[ControlState.selection.index];
     Viewer *ref    = &ControlState.reference.viewer;
 
@@ -1284,6 +1503,13 @@ void buildRect()
     rect->size = glms_vec2_sub(mousePos(), ControlState.build_origin);
 }
 
+void buildCircle()
+{
+
+    Circle *circle = &ControlState.circles.data[ControlState.selection.index];
+    circle->radius_pos = mousePos();
+}
+
 void deleteSelected()
 {
 
@@ -1299,9 +1525,15 @@ void deleteSelected()
             sh_vector_segment_remove(&ControlState.segments, ControlState.selection.index);
             break;
 
+        case SE_CIRCLE:
+            sh_vector_circle_remove(&ControlState.circles, ControlState.selection.index);
+            break;
+
         case SE_VIEWER:
             sh_vector_viewer_remove(&ControlState.viewers, ControlState.selection.index);
             break;
+
+        default: break;
     }
 
     ControlState.selection.type = SE_NONE;
@@ -1346,6 +1578,27 @@ void pushSegments()
     sh_vector_vec2_clear(&Simulation.seg_points);
 }
 
+void pushCircles()
+{
+
+    for (int i = 0; i < ControlState.circles.size; i++) {
+
+        Circle *circle = &ControlState.circles.data[i];
+
+        sh_vector_vec2_push(&Simulation.circle_centers, circle->position);
+        sh_vector_float_push(&Simulation.circle_radii, getRadius(circle));
+    }
+
+    GL_CALL( glUseProgram(Simulation.program) );
+    GL_CALL( glUniform2fv(Simulation.uniform_locations.circle_centers, (GLsizei)Simulation.circle_centers.size, (const GLfloat*)&Simulation.circle_centers.data) );
+    GL_CALL( glUniform1fv(Simulation.uniform_locations.circle_radii,   (GLsizei)Simulation.circle_radii.size,   (const GLfloat*)&Simulation.circle_radii.data) );
+    GL_CALL( glUniform1i(Simulation.uniform_locations.circle_count,    (GLint)Simulation.circle_centers.size) );
+
+    sh_vector_vec2_clear(&Simulation.circle_centers);
+    sh_vector_float_clear(&Simulation.circle_radii);
+}
+
+
 void initSimulation()
 {
 
@@ -1355,6 +1608,9 @@ void initSimulation()
     Simulation.uniform_locations = (struct _SimulationUniformLocations) {
         .seg_points       = getUniformLocation(Simulation.program, "u_seg_points"),
         .seg_point_count  = getUniformLocation(Simulation.program, "u_seg_point_count"),
+        .circle_centers   = getUniformLocation(Simulation.program, "u_circle_centers"),
+        .circle_radii     = getUniformLocation(Simulation.program, "u_circle_radii"),
+        .circle_count     = getUniformLocation(Simulation.program, "u_circle_count"),
         .view             = getUniformLocation(Simulation.program, "u_view"),
         .viewer_origin    = getUniformLocation(Simulation.program, "u_viewer_origin"),
         .view_center      = getUniformLocation(Simulation.program, "u_view_center"),
@@ -1376,7 +1632,9 @@ void initSimulation()
     vaoVertexData(&Simulation.vao, vdata, sizeof(vdata) / sizeof(vdata[0]));
     vaoIndexData(&Simulation.vao,  idata, sizeof(idata) / sizeof(idata[0]));
 
-    Simulation.seg_points = SH_VECTOR_INIT(vec2);
+    Simulation.seg_points       = SH_VECTOR_INIT(vec2);
+    Simulation.circle_centers   = SH_VECTOR_INIT(vec2);
+    Simulation.circle_radii     = SH_VECTOR_INIT(float);
 }
 
 void renderViewers()
