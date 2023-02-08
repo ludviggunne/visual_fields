@@ -28,7 +28,7 @@
 
 /* Memory */
 #define BATCH_SIZE       1024
-#define MAX_OBJECTS      128
+#define MAX_OBJECTS      16
 #define MAX_VIEWERS      8
 #define MAX_SEG_POINTS  (10 * MAX_OBJECTS)
 
@@ -36,9 +36,9 @@
 #define SELECTION_DISTANCE 10
 
 /* Style */
-#define WINDOW_INIT_W 800
-#define WINDOW_INIT_H 600
-#define CTRLP_SIZE    4
+#define WINDOW_INIT_W   800
+#define WINDOW_INIT_H   600
+#define CTRLP_SIZE      5
 
 #define BGD_C         0xFFFFFFFF
 vec4s   bgd_c;
@@ -48,9 +48,6 @@ vec4s   segment_c;
 vec4s   ctrlp_c;
 #define SELECTION_C   0x1E81B0FF
 vec4s   selection_c;
-
-#define SAMPLE_COUNT     4
-#define SAMPLE_DIFFUSION 10
 
 /* - STRUCTS */
 typedef struct {
@@ -89,7 +86,7 @@ typedef struct {
     enum {
         SE_NONE = 0, 
         SE_SEG, 
-        SE_RECT, 
+        SE_RECT,
         SE_VIEWER
     } type;
 
@@ -146,6 +143,8 @@ struct _ControlState {
     } reference;
     vec2s selection_offset;
     vec2s build_origin;
+
+    int show_control_points;
     
     sh_vector_segment segments;
     sh_vector_rect    rects;
@@ -343,16 +342,16 @@ void deleteSelected();
 int main(int argc, char *argv[])
 {
 
-    assert(glfwInit() && "Couldn't initialize GLFW");
+    glfwInit();
 
-    glfwWindowHint(GLFW_SAMPLES, 8);
+    glfwWindowHint(GLFW_SAMPLES, 16);
     WindowState = (struct _WindowState) {
 
         .handle = glfwCreateWindow(WINDOW_INIT_W, WINDOW_INIT_H, "Test Window", NULL, NULL),
         .width  = WINDOW_INIT_W,
         .height = WINDOW_INIT_H
     };
-    assert(WindowState.handle && "Couldn't initalize window");
+    assert(WindowState.handle);
 
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -365,7 +364,7 @@ int main(int argc, char *argv[])
     glfwMakeContextCurrent(WindowState.handle);
     glfwSwapInterval(1);
 
-    assert(gladLoadGLLoader((GLADloadproc)glfwGetProcAddress) && "Couldn't load OpenGL functions");
+    gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
 
     GL_CALL( glEnable(GL_BLEND) );
     GL_CALL( glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) );  
@@ -529,7 +528,7 @@ void vaoIndexData(VertexArray *vao, uint32_t *data, size_t count)
 void vaoDraw(VertexArray *vao, GLenum mode)
 {
     GL_CALL( glBindVertexArray(vao->vao) );
-    GL_CALL( glDrawElements(mode, vao->ic, GL_UNSIGNED_INT, 0) );
+    GL_CALL( glDrawElements(mode, (GLsizei)vao->ic, GL_UNSIGNED_INT, 0) );
 }
 
 void initUIstate()
@@ -667,7 +666,8 @@ void initControlState()
         .rects     =  SH_VECTOR_INIT(rect),
         .viewers   =  SH_VECTOR_INIT(viewer),
         .selection = { .type = SE_NONE, .index = 0},
-        .state     = ST_IDLE
+        .state     = ST_IDLE,
+        .show_control_points = 1
     };
 }
 
@@ -761,6 +761,10 @@ void callbackKey(GLFWwindow *window, int key, int scancode, int action, int mods
                 case GLFW_KEY_BACKSPACE:
                 case GLFW_KEY_X:
                     deleteSelected();
+                    break;
+
+                case GLFW_KEY_H:
+                    ControlState.show_control_points ^= 1;
                     break;
 
                 default: break;
@@ -864,6 +868,9 @@ void drawControlState()
             i == ControlState.selection.index && ControlState.selection.type == SE_RECT);
     }
 
+    if (!ControlState.show_control_points) return;
+
+
     for (int i = 0; i < ControlState.segments.size; i++) {
 
         drawSegmentControlPoints(&ControlState.segments.data[i],
@@ -914,6 +921,8 @@ int testSegmentSelection(vec2s mouse, size_t index)
     Segment *segment = &ControlState.segments.data[index];
     vec2s point;
 
+    if (!ControlState.show_control_points) goto just_check_line;
+
     if (controlPointIsHovered(mouse, segment->p1)) {
 
         ControlState.selection = (ControllableSelection) {
@@ -954,6 +963,8 @@ int testSegmentSelection(vec2s mouse, size_t index)
         return 1;
     }
 
+    just_check_line:
+
     if (lineIsHovered(mouse, segment->p1, segment->p2)) {
 
         ControlState.selection = (ControllableSelection) {
@@ -972,6 +983,8 @@ int testRectSelection(vec2s mouse, size_t index)
 {
     Rect *rect = &ControlState.rects.data[index];
     vec2s point;
+
+    if (!ControlState.show_control_points) goto just_check_line;
     
     if (controlPointIsHovered(mouse, rect->position)) {
 
@@ -1042,6 +1055,8 @@ int testRectSelection(vec2s mouse, size_t index)
         return 1;
     }
 
+    just_check_line:
+
     if (
         lineIsHovered(mouse, 
             (vec2s) { rect->position.x,                rect->position.y }, 
@@ -1068,6 +1083,10 @@ int testRectSelection(vec2s mouse, size_t index)
 
     return 0;
 }
+
+    if (!ControlState.show_control_points) goto just_check_line;
+
+    just_check_line:
 
 int testViewerSelection(vec2s mouse, size_t index)
 {
@@ -1295,9 +1314,9 @@ void pushSegments()
 
         Rect *rect = &ControlState.rects.data[i];
         vec2s p0 = rect->position;
-        vec2s p1 = (vec2s) { rect->position.x + rect->size.x, rect->position.y };
+        vec2s p1 = (vec2s) { rect->position.x + rect->size.x, rect->position.y                };
         vec2s p2 = (vec2s) { rect->position.x + rect->size.x, rect->position.y + rect->size.y };
-        vec2s p3 = (vec2s) { rect->position.x,                rect->position.y + rect->size.y};
+        vec2s p3 = (vec2s) { rect->position.x,                rect->position.y + rect->size.y };
 
         sh_vector_vec2_push(&Simulation.seg_points, p0);
         sh_vector_vec2_push(&Simulation.seg_points, p1);
@@ -1321,8 +1340,8 @@ void pushSegments()
     }
 
     GL_CALL( glUseProgram(Simulation.program) );
-    GL_CALL( glUniform2fv(Simulation.uniform_locations.seg_points, Simulation.seg_points.size, &Simulation.seg_points) );
-    GL_CALL( glUniform1i(Simulation.uniform_locations.seg_point_count, Simulation.seg_points.size) );
+    GL_CALL( glUniform2fv(Simulation.uniform_locations.seg_points, (GLsizei)Simulation.seg_points.size, (const GLfloat*)&Simulation.seg_points.data) );
+    GL_CALL( glUniform1i(Simulation.uniform_locations.seg_point_count, (GLint)Simulation.seg_points.size) );
 
     sh_vector_vec2_clear(&Simulation.seg_points);
 }
@@ -1355,7 +1374,7 @@ void initSimulation()
     };
 
     vaoVertexData(&Simulation.vao, vdata, sizeof(vdata) / sizeof(vdata[0]));
-    vaoIndexData(&Simulation.vao, idata, sizeof(idata) / sizeof(idata[0]));
+    vaoIndexData(&Simulation.vao,  idata, sizeof(idata) / sizeof(idata[0]));
 
     Simulation.seg_points = SH_VECTOR_INIT(vec2);
 }
@@ -1368,7 +1387,7 @@ void renderViewers()
     mat4s basic_view = GLMS_MAT4_IDENTITY;
     GL_CALL( glUniformMatrix4fv(Simulation.uniform_locations.view, 1, GL_FALSE, (const GLfloat*)basic_view.raw) );
     
-    GL_CALL( glUniform2f(Simulation.uniform_locations.buffer_size, WindowState.width, WindowState.height) );
+    GL_CALL( glUniform2f(Simulation.uniform_locations.buffer_size, (GLfloat)WindowState.width, (GLfloat)WindowState.height) );
     GL_CALL( glUniform2f(Simulation.uniform_locations.view_center, UIstate.view_center.x, UIstate.view_center.y) );
 
     for (int i = 0; i < ControlState.viewers.size; i++) {
